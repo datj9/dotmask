@@ -4,7 +4,7 @@
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { makeFake, maskText, unmaskText, isAiDomain, findSafeFlushLength, maskMessages, maskJsonPayload } from "../dist/proxy/masker.js";
+import { makeFake, maskText, isAiDomain, maskMessages, maskJsonPayload } from "../dist/proxy/masker.js";
 
 // ── makeFake ──────────────────────────────────────────────────────────────────
 
@@ -60,6 +60,13 @@ describe("makeFake", () => {
     assert.equal(makeFake("abc"), "abc");
     assert.equal(makeFake(""), "");
   });
+
+  test("does not preserve a plaintext prefix for unknown formats", () => {
+    const real = "correct-horse-battery-staple";
+    const fake = makeFake(real);
+    assert.equal(fake.length, real.length);
+    assert.notEqual(fake.slice(0, 5), real.slice(0, 5));
+  });
 });
 
 // ── maskText ──────────────────────────────────────────────────────────────────
@@ -100,6 +107,13 @@ describe("maskText (no keychain — empty map)", () => {
     assert.ok(!masked.includes("abcdefghijklmnopqrstuvwxyz12345"));
   });
 
+  test("masks standalone high-entropy encoded output", () => {
+    const encoded = "c3VwZXJzZWNyZXRwYXNzd29yZDEyMzQ1Njc4OTA=";
+    const { masked, count } = maskText(`tool output: ${encoded}`, new Map());
+    assert.equal(count, 1);
+    assert.ok(!masked.includes(encoded));
+  });
+
   test("does not mask short values", () => {
     const { masked, count } = maskText("SECRET=short", new Map());
     assert.equal(count, 0);
@@ -117,49 +131,6 @@ describe("maskText (no keychain — empty map)", () => {
   });
 });
 
-// ── unmaskText ────────────────────────────────────────────────────────────────
-
-describe("unmaskText", () => {
-  test("reverses what maskText did", () => {
-    const real = "sk-or-v1-abcdefghijklmnopqrstuvwxyz12345";
-    const fake = makeFake(real);
-    const fakeToReal = new Map([[fake, real]]);
-
-    const { unmasked, count } = unmaskText(`here is the key: ${fake} end`, fakeToReal);
-    assert.equal(count, 1);
-    assert.ok(unmasked.includes(real));
-    assert.ok(!unmasked.includes(fake));
-  });
-
-  test("handles multiple tokens", () => {
-    const r1 = "sk-or-v1-aaaabbbbccccddddeeeeffffgggg1234";
-    const r2 = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcde12345";
-    const f1 = makeFake(r1);
-    const f2 = makeFake(r2);
-    const map = new Map([[f1, r1], [f2, r2]]);
-
-    const { unmasked, count } = unmaskText(`key1=${f1} key2=${f2}`, map);
-    assert.equal(count, 2);
-    assert.ok(unmasked.includes(r1));
-    assert.ok(unmasked.includes(r2));
-  });
-
-  test("no-op when map is empty", () => {
-    const text = "no secrets here";
-    const { unmasked, count } = unmaskText(text, new Map());
-    assert.equal(count, 0);
-    assert.equal(unmasked, text);
-  });
-
-  test("round-trip: mask then unmask = original", () => {
-    const real = "sk-or-v1-abcdefghijklmnopqrstuvwxyz12345";
-    const { masked } = maskText(`my key is ${real}`, new Map());
-    const fake = makeFake(real);
-    const { unmasked } = unmaskText(masked, new Map([[fake, real]]));
-    assert.ok(unmasked.includes(real));
-  });
-});
-
 // ── isAiDomain ────────────────────────────────────────────────────────────────
 
 describe("isAiDomain", () => {
@@ -170,72 +141,6 @@ describe("isAiDomain", () => {
   test("does NOT match github.com",     () => assert.ok(!isAiDomain("github.com")));
   test("does NOT match google.com",     () => assert.ok(!isAiDomain("google.com")));
   test("does NOT match npm registry",   () => assert.ok(!isAiDomain("registry.npmjs.org")));
-});
-
-// ── findSafeFlushLength (streaming split recovery) ────────────────────────────
-
-describe("findSafeFlushLength", () => {
-  const fakeKeys = [
-    "sk-or-v1-abcdefghijklmnopqrstuvwxyz12345",
-    "sk-ant-api03-verylongrealkey1234567890abcdef",
-  ];
-
-  test("flushes everything if no prefix match is found", () => {
-    const text = "hello world! this is just a normal response chunk.";
-    const len = findSafeFlushLength(text, fakeKeys);
-    assert.equal(len, text.length, "should be totally safe to flush");
-  });
-
-  test("stops before a partial fake key matching at the end", () => {
-    // "sk-or-v1-a" is an exact prefix of the first fakekey
-    const partial = "sk-or-v1-abcde"; 
-    const text = `some response text before the key ${partial}`;
-    const len = findSafeFlushLength(text, fakeKeys);
-    
-    // safe length should be right before the split token
-    assert.equal(text.substring(0, len), "some response text before the key ");
-    assert.equal(text.substring(len), partial);
-  });
-
-  test("stops before a very short partial match at the very end", () => {
-    // just "sk" which matches "sk-or-v1..." and "sk-ant..."
-    const text = `just some text followed by sk`;
-    const len = findSafeFlushLength(text, fakeKeys);
-    
-    // safe length should chop off 'sk'
-    assert.equal(text.substring(0, len), "just some text followed by ");
-  });
-
-  test("passes through occurrences that do NOT match the prefix", () => {
-    // 'sk-something-else' doesn't match the specific fakeKeys precisely beyond 'sk-'
-    // Wait, 'sk-something' has 'sk-' as prefix which DOES match "sk-or-v1" up to 3 chars
-    // But what if it's "sk-nomatch"? It will match "sk-" suffix but nothing else.
-    // The findSafeFlushLength strictly finds if a suffix of the text matches a prefix of fakeKey.
-    // "followed by sk-" -> "sk-" matches the first 3 chars. So it will hold back "sk-".
-    const text = "followed by sk-";
-    const len = findSafeFlushLength(text, fakeKeys);
-    assert.equal(text.substring(len), "sk-");
-  });
-
-  test("if exact key is fully present in the buffer, it is flushed (unmask handles replacement)", () => {
-    // When the full key is present, findSafeFlushLength returns text.length — the whole
-    // buffer is safe to flush because unmaskText will do the replacement afterwards.
-    const text = `full key here sk-or-v1-abcdefghijklmnopqrstuvwxyz12345`;
-    const len = findSafeFlushLength(text, fakeKeys);
-    assert.equal(len, text.length, "full fake key present → flush everything, unmask will handle it");
-  });
-  
-  test("works with multiple fake keys without issue", () => {
-    const multiKeys = [
-      "sk-or-v1-abc",
-      "sk-ant-api-xyz"
-    ];
-    const text1 = "response sk-or";
-    assert.equal(findSafeFlushLength(text1, multiKeys), "response ".length);
-    
-    const text2 = "response sk-ant-a";
-    assert.equal(findSafeFlushLength(text2, multiKeys), "response ".length);
-  });
 });
 
 // ── New token types (AWS, Stripe, JWT, Sui) ───────────────────────────────────
@@ -346,21 +251,6 @@ describe("maskText — new token types", () => {
     assert.ok(masked.includes("suiprivkey"), "suiprivkey prefix must be preserved");
   });
 
-  test("round-trip: AWS key mask then unmask = original", () => {
-    const real = "AKIAIOSFODNN7EXAMPLE";
-    const { masked } = maskText(`key=${real}`, new Map());
-    const fake = makeFake(real);
-    const { unmasked } = unmaskText(masked, new Map([[fake, real]]));
-    assert.ok(unmasked.includes(real), "real AWS key must be restored after unmask");
-  });
-
-  test("round-trip: JWT mask then unmask = original", () => {
-    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-    const { masked } = maskText(`token=${jwt}`, new Map());
-    const fake = makeFake(jwt);
-    const { unmasked } = unmaskText(masked, new Map([[fake, jwt]]));
-    assert.ok(unmasked.includes(jwt), "real JWT must be restored after unmask");
-  });
 });
 
 // ── maskMessages ─────────────────────────────────────────────────────────────
@@ -529,6 +419,15 @@ describe("maskJsonPayload", () => {
     const payload = { foo: "bar", nested: [{ nope: 1 }] };
     assert.equal(maskJsonPayload(payload, new Map()), 0);
   });
+
+  test("masks generic secrets under arbitrary nested property names", () => {
+    const real = "correct horse battery staple";
+    const payload = { tool_result: { arbitrary: { database_password: real } } };
+    const count = maskJsonPayload(payload, new Map());
+
+    assert.equal(count, 1);
+    assert.notEqual(payload.tool_result.arbitrary.database_password, real);
+  });
 });
 
 // ── maskText — additional edge cases ─────────────────────────────────────────
@@ -610,73 +509,5 @@ describe("maskText — edge cases", () => {
     const { masked, count } = maskText(text, r2f);
     assert.ok(count >= 1);
     assert.ok(!masked.includes(token));
-  });
-});
-
-// ── unmaskText — additional edge cases ───────────────────────────────────────
-
-describe("unmaskText — edge cases", () => {
-  test("longest fake key matched first (substring safety)", () => {
-    const shortReal = "sk-proj-shortshortshortshort1234";
-    const longReal = "sk-proj-shortshortshortshort1234-extended";
-    const shortFake = makeFake(shortReal);
-    const longFake = makeFake(longReal);
-    const map = new Map([[shortFake, shortReal], [longFake, longReal]]);
-    const { unmasked } = unmaskText(`val=${longFake}`, map);
-    assert.ok(unmasked.includes(longReal));
-  });
-
-  test("fake key at start of string", () => {
-    const real = "sk-proj-abcdefghijklmnopqrstuvwxyz12345";
-    const fake = makeFake(real);
-    const { unmasked, count } = unmaskText(`${fake} trailing`, new Map([[fake, real]]));
-    assert.equal(count, 1);
-    assert.ok(unmasked.startsWith(real));
-  });
-
-  test("fake key at end of string", () => {
-    const real = "sk-proj-abcdefghijklmnopqrstuvwxyz12345";
-    const fake = makeFake(real);
-    const { unmasked, count } = unmaskText(`leading ${fake}`, new Map([[fake, real]]));
-    assert.equal(count, 1);
-    assert.ok(unmasked.endsWith(real));
-  });
-
-  test("fake key appearing multiple times — count is 1 (one key type)", () => {
-    const real = "sk-proj-abcdefghijklmnopqrstuvwxyz12345";
-    const fake = makeFake(real);
-    const { unmasked, count } = unmaskText(`${fake} and ${fake}`, new Map([[fake, real]]));
-    assert.equal(count, 1, "count tracks distinct key types, not occurrences");
-    const occurrences = unmasked.split(real).length - 1;
-    assert.equal(occurrences, 2);
-  });
-});
-
-// ── findSafeFlushLength — additional edge cases ──────────────────────────────
-
-describe("findSafeFlushLength — edge cases", () => {
-  test("key in the middle (not at end) — flush all", () => {
-    const fakeKeys = ["sk-or-v1-abcdefghijklmnopqrstuvwxyz12345"];
-    const text = `prefix ${fakeKeys[0]} suffix`;
-    const len = findSafeFlushLength(text, fakeKeys);
-    assert.equal(len, text.length);
-  });
-
-  test("empty fakeKeys — flush all", () => {
-    const text = "anything at all sk-or-v1-abc";
-    const len = findSafeFlushLength(text, []);
-    assert.equal(len, text.length);
-  });
-
-  test("empty text — 0", () => {
-    const len = findSafeFlushLength("", ["sk-or-v1-abc"]);
-    assert.equal(len, 0);
-  });
-
-  test("text shorter than shortest partial match", () => {
-    const fakeKeys = ["sk-or-v1-abcdefghijklmnopqrstuvwxyz12345"];
-    const text = "s";
-    const len = findSafeFlushLength(text, fakeKeys);
-    assert.equal(len, 0, "'s' matches first char of fake key — hold back");
   });
 });

@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -42,33 +42,23 @@ export function certExists(): boolean {
   return fs.existsSync(CA_CERT_PATH) && fs.existsSync(CA_KEY_PATH);
 }
 
-/**
- * Install the CA cert into macOS login Keychain and mark it as trusted.
- * Will trigger a macOS password/Touch ID prompt.
- */
-export function installCert(): boolean {
-  if (!certExists()) return false;
-  try {
-    execFileSync("security", [
-      "add-trusted-cert",
-      "-d",
-      "-r", "trustRoot",
-      "-k", LOGIN_KEYCHAIN_PATH,
-      CA_CERT_PATH,
-    ], { stdio: "inherit" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Remove the dotmask CA cert from macOS Keychain. */
+/** Remove legacy dotmask CA trust from macOS Keychain, failing if it remains. */
 export function uninstallCert(): void {
-  try {
-    execFileSync("security", [
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const existing = spawnSync("security", [
+      "find-certificate", "-c", KEYCHAIN_CERT_LABEL, LOGIN_KEYCHAIN_PATH,
+    ], { encoding: "utf8" });
+    if (existing.status !== 0) return;
+
+    const removed = spawnSync("security", [
       "delete-certificate",
       "-c", KEYCHAIN_CERT_LABEL,
       LOGIN_KEYCHAIN_PATH,
-    ], { stdio: "pipe" });
-  } catch { /* already removed */ }
+    ], { encoding: "utf8" });
+    if (removed.status !== 0) {
+      throw new Error(`failed to remove legacy dotmask CA trust: ${removed.stderr.trim() || "security command failed"}`);
+    }
+  }
+
+  throw new Error("failed to remove all legacy dotmask CA certificates");
 }

@@ -31,8 +31,8 @@ ${c.bold("HOW IT WORKS")}
 
   Before your prompt leaves your machine:
     • API keys, tokens, passwords are replaced with fake tokens
-    • Fake tokens preserve format (same prefix, same length)
-    • Your app still works — nothing changes locally
+    • Fake tokens preserve required format without revealing generic prefixes
+    • Provider responses remain untrusted and are never rewritten to real values
 
 ${c.bold("Supported APIs:")}
     ${c.green("✓")}  api.anthropic.com   (Claude)
@@ -43,7 +43,7 @@ ${c.bold("Supported APIs:")}
 
 ${c.bold("QUICK START")}
   ${c.cyan("1.")} npm install -g @ducnmm/dotmask
-  ${c.cyan("2.")} dotmask install          ${c.dim("# macOS will ask to trust the proxy cert")}
+  ${c.cyan("2.")} dotmask install          ${c.dim("# scopes the proxy CA to Claude Code")}
   ${c.cyan("3.")} dotmask allow chat.trollllm.xyz   ${c.dim("# optional custom host")}
   ${c.cyan("4.")} Restart Claude Code — done
 `);

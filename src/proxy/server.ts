@@ -12,15 +12,12 @@ import net from "node:net";
 import tls from "node:tls";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
-import { unmaskText, loadFakeToRealMapAsync, loadRealToFakeMapAsync, findSafeFlushLength, warmMaskCacheAsync, maskJsonPayload } from "./masker.js";
 import { CA_DIR, CA_CERT_PATH, CA_KEY_PATH, DOTMASK_DIR } from "./cert.js";
 import { loadAllowedHosts, normalizeHost } from "./config.js";
-import { IncrementalChunkedBodyParser, SseEventBuffer, encodeChunkedPayload, TERMINAL_CHUNK } from "./sse.js";
-import { parseCompleteHttpRequest } from "./http.js";
+import { parseCompleteHttpRequest, sanitizeRequestBody } from "./http.js";
 import { parsePortFlag } from "../utils.js";
 
 // ── Config ───────────────────────────────────────────────────────────────
@@ -132,23 +129,6 @@ function ensureCA(): void {
 
 // ── Request body masking ──────────────────────────────────────────────────────
 
-async function maskRequestBody(rawBody: Buffer, host: string): Promise<Buffer> {
-  let body: unknown;
-  try {
-    body = JSON.parse(rawBody.toString("utf8"));
-  } catch {
-    return rawBody; // non-JSON body — pass through
-  }
-
-  const realToFake = await loadRealToFakeMapAsync();
-  const totalCount = maskJsonPayload(body, realToFake);
-  if (totalCount > 0) {
-    dbg(`masked ${totalCount} secret(s) in request to ${host}`);
-    return Buffer.from(JSON.stringify(body), "utf8");
-  }
-  return rawBody;
-}
-
 function writeProxyErrorResponse(clientTls: tls.TLSSocket, message: string): void {
   if (clientTls.destroyed) return;
   const body = JSON.stringify({ error: message });
@@ -254,12 +234,21 @@ function handleConnect(
   tlsServer.on("data", (chunk: Buffer) => {
     pending = Buffer.concat([pending, chunk]);
 
-    while (true) {
-      const parsed = parseCompleteHttpRequest(pending);
-      if (!parsed) return;
+    try {
+      while (true) {
+        const parsed = parseCompleteHttpRequest(pending);
+        if (!parsed) return;
 
-      pending = pending.subarray(parsed.bytesConsumed);
-      startForward(parsed.requestLine, parsed.headers, parsed.body);
+        pending = pending.subarray(parsed.bytesConsumed);
+        startForward(parsed.requestLine, parsed.headers, parsed.body);
+      }
+    } catch (err) {
+      connectionFailed = true;
+      pending = Buffer.alloc(0);
+      writeProxyErrorResponse(
+        tlsServer,
+        err instanceof Error ? `dotmask blocked malformed request: ${err.message}` : "dotmask blocked malformed request",
+      );
     }
   });
 }
@@ -276,12 +265,10 @@ async function forwardRequest(
   const urlPath = requestLine.split(" ")[1] ?? "/";
 
   const contentType = reqHeaders["content-type"] ?? "";
-  let finalBody = bodyBuf;
-  if (contentType.includes("application/json") && method !== "GET") {
-    finalBody = await maskRequestBody(bodyBuf, hostname);
-  }
-
-  const fakeToReal = await loadFakeToRealMapAsync();
+  const contentEncoding = reqHeaders["content-encoding"] ?? "";
+  const sanitized = sanitizeRequestBody(bodyBuf, contentType, contentEncoding);
+  if (sanitized.count > 0) dbg(`masked ${sanitized.count} secret(s) in request to ${hostname}`);
+  const finalBody = sanitized.body;
 
   const outHeaders: Record<string, string> = { ...reqHeaders };
   outHeaders["content-length"] = String(finalBody.length);
@@ -291,17 +278,6 @@ async function forwardRequest(
   await new Promise<void>((resolve, reject) => {
     const outSocket = tls.connect({ host: hostname, port, servername: hostname });
     let settled = false;
-    let responseHeadersDone = false;
-    let textBuffer = "";
-    const decoder = new StringDecoder("utf8");
-    const fakeKeys = Array.from(fakeToReal.keys());
-    let isSse = false;
-    let isChunked = false;
-    let isCompressed = false;
-    let rawBuf: Buffer = Buffer.alloc(0);
-    let handleEndCalled = false;
-    let sseChunkParser: IncrementalChunkedBodyParser | null = null;
-    let sseEventBuffer: SseEventBuffer | null = null;
 
     function finish(err?: Error): void {
       if (settled) return;
@@ -318,118 +294,6 @@ async function forwardRequest(
       if (!clientTls.destroyed) clientTls.write(chunk);
     }
 
-    function sendSseEvents(events: string[]): void {
-      for (const event of events) {
-        if (event.length === 0) continue;
-        if (isChunked) {
-          sendToClient(encodeChunkedPayload(event));
-        } else {
-          sendToClient(Buffer.from(event, "utf8"));
-        }
-      }
-      if (events.length > 0) dbg(`[SSE] flushed ${events.length} event(s)`);
-    }
-
-    function processSseBody(rawBody: Buffer): void {
-      if (rawBody.length === 0 || handleEndCalled) return;
-      if (!sseEventBuffer) sseEventBuffer = new SseEventBuffer(fakeToReal);
-
-      if (!isChunked) {
-        sendSseEvents(sseEventBuffer.push(rawBody));
-        return;
-      }
-
-      if (!sseChunkParser) sseChunkParser = new IncrementalChunkedBodyParser();
-      const parsed = sseChunkParser.push(rawBody);
-      for (const payload of parsed.payloads) {
-        sendSseEvents(sseEventBuffer.push(payload));
-      }
-      if (parsed.terminal) handleEnd();
-    }
-
-    function handleData(chunk: Buffer): void {
-      if (!responseHeadersDone) {
-        rawBuf = Buffer.concat([rawBuf, chunk]);
-        textBuffer += decoder.write(chunk);
-
-        const headerEnd = textBuffer.indexOf("\r\n\r\n");
-        if (headerEnd === -1) return;
-
-        responseHeadersDone = true;
-        const headers = textBuffer.slice(0, headerEnd + 4);
-        const ctHeaderMatch = headers.toLowerCase().match(/content-type:\s*([^\r\n]+)/);
-        const ctValue = ctHeaderMatch?.[1]?.trim() ?? "(none)";
-        const ceHeaderMatch = headers.toLowerCase().match(/content-encoding:\s*([^\r\n]+)/);
-        const ceValue = ceHeaderMatch?.[1]?.trim() ?? "none";
-        isSse = /content-type\s*:\s*text\/event-stream/i.test(headers);
-        isChunked = /transfer-encoding\s*:\s*chunked/i.test(headers);
-        isCompressed = !isSse && /content-encoding\s*:\s*(gzip|br|zstd|deflate)/i.test(headers);
-        dbg(`response isSse=${isSse}, isChunked=${isChunked}, isCompressed=${isCompressed}, content-type=${ctValue}, content-encoding=${ceValue} for ${hostname}`);
-        sendToClient(Buffer.from(headers, "utf8"));
-
-        if (isCompressed) {
-          const rawBody = rawBuf.slice(headerEnd + 4);
-          if (rawBody.length > 0) sendToClient(rawBody);
-          rawBuf = Buffer.alloc(0);
-          textBuffer = "";
-          return;
-        }
-        if (isSse) {
-          sseEventBuffer = new SseEventBuffer(fakeToReal);
-          if (isChunked) sseChunkParser = new IncrementalChunkedBodyParser();
-          const rawBody = rawBuf.slice(headerEnd + 4);
-          rawBuf = Buffer.alloc(0);
-          textBuffer = "";
-          processSseBody(rawBody);
-          return;
-        }
-
-        textBuffer = textBuffer.slice(headerEnd + 4);
-        rawBuf = Buffer.alloc(0);
-      } else {
-        if (isCompressed) {
-          sendToClient(chunk);
-          return;
-        }
-        if (isSse) {
-          processSseBody(chunk);
-          return;
-        }
-        textBuffer += decoder.write(chunk);
-      }
-
-      if (textBuffer.length === 0) return;
-
-      const safeLen = findSafeFlushLength(textBuffer, fakeKeys);
-      if (safeLen > 0) {
-        const toProcess = textBuffer.slice(0, safeLen);
-        textBuffer = textBuffer.slice(safeLen);
-        const { unmasked, count } = unmaskText(toProcess, fakeToReal);
-        if (count > 0) dbg(`[non-SSE] unmasked ${count} secret(s)`);
-        sendToClient(Buffer.from(unmasked, "utf8"));
-      }
-    }
-
-    function handleEnd(): void {
-      if (handleEndCalled) return;
-      handleEndCalled = true;
-      const decoderTail = decoder.end();
-      if (!isSse && !isCompressed) textBuffer += decoderTail;
-      dbg(`[handleEnd] isSse=${isSse} isCompressed=${isCompressed} textBuffer=${textBuffer.length}B`);
-
-      if (isSse) {
-        if (!sseEventBuffer) sseEventBuffer = new SseEventBuffer(fakeToReal);
-        sendSseEvents(sseEventBuffer.finish());
-        if (isChunked) sendToClient(TERMINAL_CHUNK);
-      } else if (!isCompressed && textBuffer.length > 0) {
-        const { unmasked, count } = unmaskText(textBuffer, fakeToReal);
-        if (count > 0) dbg(`[handleEnd] unmasked ${count} remaining secret(s)`);
-        sendToClient(Buffer.from(unmasked, "utf8"));
-      }
-
-      finish();
-    }
-
     outSocket.on("error", (e) => {
       dbg("upstream error:", e.message);
       finish(e instanceof Error ? e : new Error(String(e)));
@@ -444,14 +308,10 @@ async function forwardRequest(
       if (finalBody.length > 0) outSocket.write(finalBody);
     });
 
-    if (fakeToReal.size === 0) {
-      outSocket.on("data", sendToClient);
-      outSocket.on("end", () => finish());
-      return;
-    }
-
-    outSocket.on("data", handleData);
-    outSocket.on("end", handleEnd);
+    // Provider responses are untrusted input. Forward them byte-for-byte and
+    // never materialize a real secret in model-controlled text or tool calls.
+    outSocket.on("data", sendToClient);
+    outSocket.on("end", () => finish());
   });
 }
 
@@ -459,7 +319,6 @@ async function forwardRequest(
 
 async function main(): Promise<void> {
   ensureCA();
-  void warmMaskCacheAsync().catch((e) => dbg("mask cache warmup failed:", e));
   dbg("MITM allowlist:", Array.from(ALLOWED_HOSTS));
 
   const server = http.createServer((req, res) => {

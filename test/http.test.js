@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { parseCompleteHttpRequest } from "../dist/proxy/http.js";
+import { parseCompleteHttpRequest, sanitizeRequestBody } from "../dist/proxy/http.js";
 
 describe("parseCompleteHttpRequest", () => {
   test("parses content-length request with UTF-8 body without corruption", () => {
@@ -69,5 +69,59 @@ describe("parseCompleteHttpRequest", () => {
     assert.equal(parsed.requestLine, "GET /one HTTP/1.1");
     assert.equal(parsed.bytesConsumed, first.length);
     assert.equal(combined.subarray(parsed.bytesConsumed).toString("latin1"), second.toString("latin1"));
+  });
+
+  test("rejects ambiguous content-length plus transfer-encoding framing", () => {
+    const request = Buffer.from(
+      "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+      "latin1",
+    );
+    assert.throws(() => parseCompleteHttpRequest(request), /ambiguous request framing/);
+  });
+
+  test("rejects duplicate headers", () => {
+    const request = Buffer.from(
+      "GET / HTTP/1.1\r\nHost: example.com\r\nHost: attacker.example\r\n\r\n",
+      "latin1",
+    );
+    assert.throws(() => parseCompleteHttpRequest(request), /duplicate request header/);
+  });
+});
+
+describe("sanitizeRequestBody", () => {
+  test("recursively masks secrets in arbitrary JSON properties", () => {
+    const real = "correct horse battery staple";
+    const input = Buffer.from(JSON.stringify({ messages: [{ metadata: { password: real } }] }));
+    const result = sanitizeRequestBody(input, "application/json", "");
+    const parsed = JSON.parse(result.body.toString("utf8"));
+
+    assert.equal(result.count, 1);
+    assert.notEqual(parsed.messages[0].metadata.password, real);
+    assert.equal(parsed.messages[0].metadata.password.length, real.length);
+  });
+
+  test("blocks malformed JSON instead of forwarding it", () => {
+    assert.throws(
+      () => sanitizeRequestBody(Buffer.from("{invalid"), "application/json", ""),
+      /invalid JSON request body/,
+    );
+  });
+
+  test("blocks compressed and binary request bodies", () => {
+    assert.throws(
+      () => sanitizeRequestBody(Buffer.from("payload"), "application/json", "gzip"),
+      /unsupported request content-encoding/,
+    );
+    assert.throws(
+      () => sanitizeRequestBody(Buffer.from([0, 1, 2]), "application/octet-stream", ""),
+      /unsupported request content-type/,
+    );
+  });
+
+  test("masks secrets in textual non-JSON bodies", () => {
+    const real = "sk-proj-abcdefghijklmnopqrstuvwxyz12345";
+    const result = sanitizeRequestBody(Buffer.from(`token=${real}`), "text/plain", "");
+    assert.equal(result.count, 1);
+    assert.ok(!result.body.toString("utf8").includes(real));
   });
 });

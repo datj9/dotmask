@@ -1,66 +1,44 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.0.x   | :white_check_mark: |
+| Version | Supported |
+| --- | --- |
+| 2.x | Yes |
+| 1.x | No — response unmasking is unsafe |
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-If you discover a security vulnerability within dotmask, please create an issue or contact the maintainer directly.
+Please report vulnerabilities privately to the maintainer before public disclosure. Include the affected version, reproduction steps, impact, and any suggested mitigation. Avoid including live credentials in reports.
 
-Please include:
+## Security design
 
-1. Description of the vulnerability
-2. Steps to reproduce
-3. Potential impact
-4. Suggested fix (if any)
+Dotmask 2 is a one-way redaction proxy:
 
-**We ask that you:**
-- Give us reasonable time to address the issue before making any public disclosure
-- Make a good faith effort to avoid privacy violations, destruction of data, and interruption of service
+- Only exact allowlisted hostnames are intercepted.
+- Upstream TLS certificate validation remains enabled.
+- Supported request bodies are scanned before forwarding.
+- Malformed, compressed, binary, and unsupported bodies are blocked for intercepted hosts.
+- JSON traversal covers every string leaf, with stricter handling for secret-named properties.
+- Pseudonyms use a random process-local HMAC key and do not reveal prefixes for unknown formats.
+- Real secret mappings are request-local and are not persisted.
+- Provider responses are never unmasked. This prevents model-controlled text and tool calls from acting as a secret-resolution oracle.
+- The CA private key and CA directory use restrictive filesystem permissions.
+- Claude Code trusts the CA through `NODE_EXTRA_CA_CERTS`; no system-wide trust is installed.
 
-## Security Design
+## Threat model and limitations
 
-### MITM Proxy Architecture
+Dotmask is intended to reduce accidental disclosure in AI prompts and tool results. It does not protect against:
 
-dotmask uses a local MITM (Man-in-the-Middle) HTTPS proxy to intercept and modify traffic. This requires:
+- A local agent that already has permission to read files, environment variables, Keychain entries, or process memory.
+- Tool calls that send local data directly to another host.
+- Secrets in provider authentication headers; those must reach the provider.
+- Traffic to non-allowlisted hosts, which is tunneled without inspection.
+- Novel encodings, fragments, or formats that evade both known-pattern and entropy detection.
+- A compromised local user account, proxy process, Node runtime, OpenSSL binary, or generated CA private key.
 
-1. **CA Certificate Generation**: A custom CA is generated at `~/.dotmask/ca/`
-2. **System Trust**: The CA must be installed and trusted in macOS Keychain
-3. **Local Traffic Only**: Only intercepts traffic to configured AI provider domains
+Treat dotmask as defense in depth. Keep agent tool approvals enabled, sandbox untrusted repositories, restrict outbound network access, and use short-lived least-privilege credentials.
 
-### Key Security Properties
+## Upgrade and cleanup
 
-| Property | Implementation |
-|----------|----------------|
-| Secrets never leave machine | MITM intercepts before TLS, mask before forwarding |
-| Format preservation | Fakes maintain same prefix/length/charset as real |
-| Secure storage | Real secrets stored in macOS Keychain |
-| Memory safety | Secrets cleared from memory after masking |
-| Cache TTL | Keychain lookups cached for 30s only |
-
-### Known Limitations
-
-1. **Header masking**: Currently dotmask only masks secrets in request bodies, not HTTP headers
-2. **Pattern matching**: Secrets must match known patterns or have high entropy to be masked
-3. **Local-only**: CA certificate must be trusted on the same machine
-
-### Threat Model
-
-dotmask protects against:
-
-- ✅ Accidental secret leaks in AI prompts
-- ✅ Secrets being stored in AI provider logs
-- ✅ Secrets being used for training data
-
-dotmask does NOT protect against:
-
-- ❌ Malicious Claude Code prompts that exfiltrate secrets
-- ❌ Compromised AI providers
-- ❌ Secrets in file system (use other tools like git-secrets, Talisman)
-
-## Updates
-
-Security advisories will be posted to the GitHub repository.
+Installing version 2 removes a legacy dotmask CA from the login Keychain when present. `dotmask uninstall` fails visibly if daemon or trust cleanup fails, removes legacy mapping entries it can identify, and deletes `~/.dotmask` only after the preceding cleanup succeeds.

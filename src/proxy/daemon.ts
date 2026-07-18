@@ -78,9 +78,10 @@ export function installDaemon(port: number): void {
 /** Unload and remove the launchd agent. */
 export function uninstallDaemon(): void {
   if (fs.existsSync(PLIST_PATH)) {
-    try {
+    if (isDaemonLoaded()) {
       execFileSync("launchctl", ["unload", PLIST_PATH], { stdio: "pipe" });
-    } catch { /* already unloaded */ }
+      if (isDaemonLoaded()) throw new Error("dotmask launch agent is still loaded after unload");
+    }
     fs.rmSync(PLIST_PATH, { force: true });
   }
 }

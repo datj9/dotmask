@@ -151,7 +151,7 @@ describe("install settings helpers", () => {
         daemonLoaded: true,
         daemonRunning: true,
         certExists: true,
-        certTrusted: true,
+        certTrusted: false,
       },
     );
 
@@ -179,7 +179,7 @@ describe("install settings helpers", () => {
         daemonLoaded: true,
         daemonRunning: true,
         certExists: true,
-        certTrusted: true,
+        certTrusted: false,
       },
     );
 
@@ -202,7 +202,7 @@ describe("install settings helpers", () => {
         daemonLoaded: true,
         daemonRunning: true,
         certExists: true,
-        certTrusted: true,
+        certTrusted: false,
       },
     );
 

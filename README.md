@@ -1,98 +1,71 @@
 # dotmask
 
-mask secrets before they leave your machine.
+Best-effort, one-way secret redaction for AI API requests on macOS.
 
-`dotmask` runs a local HTTPS proxy for Claude Code and similar tools. it replaces real secrets with format-preserving fakes on the way out, then restores them locally on the way back.
+`dotmask` runs a local HTTPS proxy for Claude Code. Before a supported request reaches an allowed AI provider, it replaces recognized credentials and high-entropy values with keyed, format-preserving fakes. Provider responses are forwarded unchanged: dotmask never inserts a real secret into assistant text or model-generated tool arguments.
 
-## install
+## Install
 
 ```bash
 npm install -g @ducnmm/dotmask
 dotmask install
 ```
 
-restart Claude Code after install.
+Restart Claude Code after installation. The generated proxy CA is scoped to Claude Code with `NODE_EXTRA_CA_CERTS`; dotmask does not install a system-trusted root.
 
-## use
+Version 2 is intentionally incompatible with the old response-unmasking behavior. Tool calls that contain a fake credential must obtain the real credential from a trusted local environment at execution time.
 
-use Claude Code like normal. dotmask runs automatically after install.
+## Commands
 
-## supported providers
+- `dotmask install [--port <n>]` — install and start the proxy
+- `dotmask allow <host>` — add an intercepted provider hostname
+- `dotmask disallow <host>` — remove an intercepted hostname
+- `dotmask hosts` — list intercepted hostnames
+- `dotmask status` — show proxy status
+- `dotmask doctor` — diagnose installation issues
+- `dotmask uninstall` — remove the daemon, settings, legacy trust, certificates, mappings, and logs
 
-- `api.anthropic.com` - Anthropic (Claude)
-- `api.openai.com` - OpenAI (GPT)
-- `openrouter.ai`, `api.openrouter.ai` - OpenRouter
-- `generativelanguage.googleapis.com` - Google AI (Gemini)
-- `api.deepseek.com` - DeepSeek
-- `api.groq.com` - Groq
-- `api.moonshot.ai` - Moonshot (Kimi)
-- `api.together.ai` - Together AI
-- `api.fireworks.ai` - Fireworks AI
-- `api.cerebras.ai` - Cerebras
-- `api.x.ai` - xAI (Grok)
-- `api.inference.huggingface.co` - Hugging Face
-- `api.minimax.io`, `api.minimax.chat` - MiniMax
+## Security behavior
 
-`~/.dotmask/config.json` controls the allowed host list.
+For allowlisted hosts, dotmask:
 
-add a custom host with:
+1. Terminates the client's TLS connection locally.
+2. Rejects compressed, binary, malformed JSON, and unsupported request bodies instead of forwarding them uninspected.
+3. Recursively scans every string in JSON requests, plus supported textual request bodies.
+4. Replaces known token formats, secret-named properties, environment assignments, and high-entropy values.
+5. Forwards provider responses byte-for-byte without restoring secrets.
 
-```bash
-dotmask allow chat.trollllm.xyz
-```
+Fakes are derived with a random, process-local HMAC key. They are stable during one proxy run but cannot be recomputed offline by the provider. Real-to-fake mappings are request-local and real secrets are not persisted by dotmask.
 
-## commands
+## Supported providers
 
-- `dotmask install` - install proxy
-- `dotmask install --port 18788` - custom port
-- `dotmask allow <host>` - add allowed host
-- `dotmask disallow <host>` - remove host
-- `dotmask hosts` - list allowed hosts
-- `dotmask status` - show status
-- `dotmask doctor` - diagnose issues
-- `dotmask uninstall` - remove everything
+The default allowlist includes Anthropic, OpenAI, OpenRouter, Google AI, DeepSeek, Groq, Moonshot, Together, Fireworks, Cerebras, xAI, Hugging Face, and MiniMax endpoints. `~/.dotmask/config.json` controls the exact list.
 
-## how it works
+## Important limitations
 
-1. your prompt with API keys goes to Claude Code
-2. dotmask intercepts and replaces real keys with fakes
-3. fake keys go to the AI API - API thinks its valid
-4. response comes back with fake keys
-5. dotmask swaps fakes back to real keys
-6. Claude Code sees the real response
+Dotmask reduces accidental disclosure; it is not a sandbox, DLP system, or authorization boundary.
 
-your secrets never leave your machine.
+- Provider authentication headers are not masked because the provider requires them. The provider receives those credentials, although the model normally does not.
+- Traffic to non-allowlisted hosts is passed through without inspection.
+- A model with filesystem or shell-tool permission may read or exfiltrate local data outside the AI request path. Use tool approvals, sandboxing, least-privilege credentials, and network controls.
+- Pattern and entropy detection can have false negatives and false positives. Unsupported request formats are blocked for intercepted hosts.
+- Fakes deliberately cannot be converted back into real credentials by model output. Generated commands should reference local environment variables or another trusted credential mechanism.
 
-## supported secrets
-
-- Anthropic keys: `sk-ant-api03-...`
-- OpenAI keys: `sk-proj-...`, `sk-...`
-- Stripe: `sk_live_...`, `sk_test_...`
-- AWS: `AKIA...`
-- Google AI: `AIza...`
-- GitHub PATs: `ghp_...`, `gho_...`, `github_pat_...`
-- Slack: `xoxb-...`, `xoxp-...`
-- JWT tokens
-- Database URLs: `postgres://user:pass@...`
-- EVM private keys: `0x...` (64 chars)
-
-## debugging
+## Debugging
 
 ```bash
-# view logs
 tail -f ~/.dotmask/proxy.err.log
-
-# run manually with debug
 DOTMASK_DEBUG=1 node dist/proxy/server.js --port 18787
 ```
 
-## notes
+Debug logs contain counts and connection metadata, not request or response bodies.
 
-- macOS only
+## Requirements
+
+- macOS
 - Node.js 18+
-- `openssl` required
-- secrets stored in macOS Keychain
+- `openssl`
 
-## license
+## License
 
 MIT

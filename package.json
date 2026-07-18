@@ -1,8 +1,8 @@
 {
   "name": "@ducnmm/dotmask",
-  "version": "1.0.7",
+  "version": "2.0.0",
   "type": "module",
-  "description": "Transparent AI secret masking for macOS. Runs a local HTTPS proxy that replaces real API keys with format-identical fakes before they reach the AI, then restores them in tool-call responses.",
+  "description": "One-way AI secret redaction for macOS. Replaces secrets with keyed, format-preserving fakes before requests reach an AI provider.",
   "bin": {
     "dotmask": "bin/dotmask.js",
     "dm": "bin/dotmask.js"

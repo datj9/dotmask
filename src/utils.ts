@@ -17,7 +17,7 @@ export const dim   = (msg: string) => console.log(c.dim(`  ${msg}`));
 
 export function requireMacOS(): void {
   if (process.platform !== "darwin") {
-    throw new Error("macOS Keychain required. dotmask only works on macOS.");
+    throw new Error("macOS launchd integration required. dotmask only works on macOS.");
   }
 }
 

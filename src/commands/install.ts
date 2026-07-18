@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { ok, warn, log, error, c, parsePortFlag } from "../utils.js";
-import { CA_CERT_PATH, certExists, isCertTrusted, installCert, uninstallCert } from "../proxy/cert.js";
+import { CA_CERT_PATH, DOTMASK_DIR, certExists, isCertTrusted, uninstallCert } from "../proxy/cert.js";
 import { installDaemon, uninstallDaemon, isDaemonLoaded, isDaemonRunning } from "../proxy/daemon.js";
 
 const DEFAULT_PORT = 18787;
@@ -273,7 +274,7 @@ export function buildDoctorChecks(
     ["Proxy daemon loaded", deps.daemonLoaded, "Run dotmask install"],
     ["Proxy daemon running", deps.daemonRunning, "Run dotmask install or check ~/.dotmask/proxy.err.log"],
     ["CA cert exists", deps.certExists, "Restart proxy — it generates CA on first run"],
-    ["CA cert trusted", deps.certTrusted, "Run dotmask install (triggers macOS trust dialog)"],
+    ["Legacy system CA trust removed", !deps.certTrusted, "Run dotmask install to remove broad legacy trust"],
     [
       "Claude Code settings readable",
       settings.ok,
@@ -322,6 +323,32 @@ function removeProxy(settingsPath: string): RemoveResult {
   return result;
 }
 
+function removeLegacyKeychainMappings(): void {
+  const mapsDir = path.join(DOTMASK_DIR, "maps");
+  if (!fs.existsSync(mapsDir)) return;
+
+  const fakeKeys = new Set<string>();
+  for (const file of fs.readdirSync(mapsDir).filter((name) => name.endsWith(".json"))) {
+    try {
+      const parsed: unknown = JSON.parse(fs.readFileSync(path.join(mapsDir, file), "utf8"));
+      if (Array.isArray(parsed)) {
+        for (const value of parsed) if (typeof value === "string") fakeKeys.add(value);
+      }
+    } catch {
+      throw new Error(`cannot parse legacy mapping file: ${path.join(mapsDir, file)}`);
+    }
+  }
+
+  for (const fakeKey of fakeKeys) {
+    const result = spawnSync("security", [
+      "delete-generic-password", "-s", "dotmask", "-a", fakeKey,
+    ], { encoding: "utf8" });
+    if (result.status !== 0 && !/could not be found|item not found/i.test(result.stderr)) {
+      throw new Error(`failed to remove a legacy Keychain mapping: ${result.stderr.trim() || "security command failed"}`);
+    }
+  }
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 export function install(args: string[]): number {
@@ -347,17 +374,18 @@ export function install(args: string[]): number {
     waited += 500;
   }
 
-  // 3. Install CA cert
+  // 3. Remove broad trust left by older dotmask versions. Claude Code trusts
+  // the proxy CA only through NODE_EXTRA_CA_CERTS below.
   if (!certExists()) {
     warn("CA cert not yet generated — run `dotmask doctor` after a moment");
   } else if (isCertTrusted()) {
-    ok("CA cert already trusted");
-  } else {
-    log("\nInstalling CA certificate (you may see a macOS password prompt)...");
-    if (installCert()) {
-      ok("CA cert installed and trusted");
-    } else {
-      warn("CA cert install may have failed — run `dotmask doctor` to verify");
+    try {
+      uninstallCert();
+      ok("Removed legacy system-wide CA trust");
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      try { uninstallDaemon(); } catch { /* preserve the primary error */ }
+      return 1;
     }
   }
 
@@ -408,7 +436,7 @@ export function uninstall(_args: string[]): number {
 
   try {
     uninstallCert();
-    ok("CA cert removed from Keychain");
+    ok("Legacy CA trust removed from Keychain");
   } catch (err) {
     hadError = true;
     error(err instanceof Error ? err.message : String(err));
@@ -426,6 +454,17 @@ export function uninstall(_args: string[]): number {
     error(err instanceof Error ? err.message : String(err));
   }
 
+  if (!hadError) {
+    try {
+      removeLegacyKeychainMappings();
+      fs.rmSync(DOTMASK_DIR, { recursive: true, force: true });
+      ok("Removed dotmask certificates, mappings, and logs");
+    } catch (err) {
+      hadError = true;
+      error(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   console.log("\n  Restart Claude Code to deactivate.\n");
   return hadError ? 1 : 0;
 }
@@ -435,8 +474,8 @@ export function status(): number {
 
   const running = isDaemonRunning();
   const loaded = isDaemonLoaded();
-  const trusted = isCertTrusted();
   const certOk = certExists();
+  const legacyTrusted = isCertTrusted();
 
   console.log(
     loaded
@@ -449,9 +488,9 @@ export function status(): number {
       : `  ${c.yellow("○")}  CA cert: ${c.yellow("not generated yet")}`
   );
   console.log(
-    trusted
-      ? `  ${c.green("●")}  CA cert: ${c.green("trusted by macOS")}`
-      : `  ${c.yellow("○")}  CA cert: ${c.yellow("not trusted (run dotmask install)")}`
+    legacyTrusted
+      ? `  ${c.red("●")}  System CA trust: ${c.red("legacy broad trust remains; run dotmask install")}`
+      : `  ${c.dim("○")}  System CA trust: ${c.dim("not installed; scoped with NODE_EXTRA_CA_CERTS")}`,
   );
 
   // Check Claude Code settings
